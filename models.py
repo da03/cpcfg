@@ -80,12 +80,12 @@ class CompPCFG(nn.Module):
       self.z = torch.zeros(batch_size, 1).cuda()
 
     t_emb = self.t_emb
-    nt_emb = self.nt_emb
+    nt_emb = self.nt_emb # nt_states, state_dim
     root_emb = self.root_emb
 
     root_emb = root_emb.expand(batch_size, self.state_dim)
     t_emb = t_emb.unsqueeze(0).unsqueeze(1).expand(batch_size, n, self.t_states, self.state_dim)
-    nt_emb = nt_emb.unsqueeze(0).expand(batch_size, self.nt_states, self.state_dim)
+    nt_emb = nt_emb.unsqueeze(0).expand(batch_size, self.nt_states, self.state_dim) # bsz, nt_states, state_dim
 
     if self.z_dim > 0:
       root_emb = torch.cat([root_emb, z], 1)
@@ -93,12 +93,12 @@ class CompPCFG(nn.Module):
       z_expand = z_expand.unsqueeze(2).expand(batch_size, n, self.t_states, self.z_dim)
       t_emb = torch.cat([t_emb, z_expand], 3)
       nt_emb = torch.cat([nt_emb, z.unsqueeze(1).expand(batch_size, self.nt_states, 
-                                                         self.z_dim)], 2)
+                                                         self.z_dim)], 2) # bsz, nt_states, state_dim+z_dim
     root_scores = F.log_softmax(self.root_mlp(root_emb), 1)
     unary_scores = F.log_softmax(self.vocab_mlp(t_emb), 3)
     x_expand = x.unsqueeze(2).expand(batch_size, x.size(1), self.t_states).unsqueeze(3)
     unary = torch.gather(unary_scores, 3, x_expand).squeeze(3)
-    rule_score = F.log_softmax(self.rule_mlp(nt_emb), 2) # nt x t**2
+    rule_score = F.log_softmax(self.rule_mlp(nt_emb), 2) # nt x t**2 # bsz, nt_states, all_states**1
     rule_scores = rule_score.view(batch_size, self.nt_states, self.all_states, self.all_states)
     log_Z = self.pcfg._inside(unary, rule_scores, root_scores)
     if self.z_dim == 0:

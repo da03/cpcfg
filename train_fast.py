@@ -17,7 +17,7 @@ from data import Dataset
 from PCFG import PCFG
 from utils import *
 from models import CompPCFG
-from model_fast import CPCFG
+from model_fast import CPCFG, CPCFG2, CPCFG3
 from torch.nn.init import xavier_uniform_
 from torch_struct import SentCFG
 
@@ -111,6 +111,10 @@ def main(args, print):
   
   if args.model_type == '4th':
       model = CPCFG
+  elif args.model_type == '5th':
+      model = CPCFG2
+  elif args.model_type == '6th':
+      model = CPCFG3
   else:
       raise NameError("Invalid parser type: {}".format(opt.parser_type)) 
   kwarg = {
