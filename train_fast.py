@@ -17,7 +17,7 @@ from data import Dataset
 from PCFG import PCFG
 from utils import *
 from models import CompPCFG
-from model_fast import CPCFG, CPCFG2, CPCFG3
+from model_fast import CPCFG, CPCFG2, CPCFG3, CPCFGFixProj, CPCFGProj, CPCFGProjDebug, CPCFGProj2
 from torch.nn.init import xavier_uniform_
 from torch_struct import SentCFG
 
@@ -93,6 +93,7 @@ parser.add_argument('--print_every', type=int, default=1000, help='print stats a
 parser.add_argument('--reg_h_alpha', default=0., type=float, help='entropy of PCFG')
 parser.add_argument('--reg_d_alpha', default=0., type=float, help='prob. dist. of rules of diff. LHS')
 parser.add_argument('--reg_c_alpha', default=0., type=float, help='prob. dist. of rules of the same LHS')
+parser.add_argument('--num_features', default=0., type=int, help='prob. dist. of rules of the same LHS')
 
 def main(args, print):
   random.seed(args.seed)
@@ -115,6 +116,14 @@ def main(args, print):
       model = CPCFG2
   elif args.model_type == '6th':
       model = CPCFG3
+  elif args.model_type == '7th':
+      model = CPCFGFixProj
+  elif args.model_type == '8th':
+      model = CPCFGProj
+  elif args.model_type == '9th':
+      model = CPCFGProjDebug
+  elif args.model_type == '10th':
+      model = CPCFGProj2
   else:
       raise NameError("Invalid parser type: {}".format(opt.parser_type)) 
   kwarg = {
@@ -128,7 +137,8 @@ def main(args, print):
                   h_dim = args.h_dim,
                   w_dim = args.w_dim,
                   z_dim = args.z_dim,
-                  s_dim = args.state_dim, **kwarg)
+                  s_dim = args.state_dim, 
+                  num_features=args.num_features, **kwarg)
     if args.model_init:
         checkpoint = torch.load(args.model_init, map_location='cpu')
         init_model = checkpoint["model"]
@@ -147,6 +157,7 @@ def main(args, print):
             print("perturb parser's params.")
             perturb_params(init_model, model)
   else:
+    assert False
     from torch_struct.networks import CompPCFG as model 
     model = model(vocab = vocab_size,
                   state_dim = args.state_dim,
@@ -228,6 +239,7 @@ def main(args, print):
       total_c += rule_C.sum().item()
 
       kl = torch.zeros_like(nll) if kl is None else kl
+      #import pdb; pdb.set_trace()
       (nll + kl + reg).mean().backward()
       train_nll += nll.sum().item()
       train_kl += kl.sum().item()
