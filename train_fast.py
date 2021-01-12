@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import sys
 import os
+import wandb
+wandb.init(project="pcfg")
 
 import argparse
 import json
@@ -126,6 +128,10 @@ def main(args, print):
       model = CPCFGProj2
   else:
       raise NameError("Invalid parser type: {}".format(opt.parser_type)) 
+  config = wandb.config
+  config.lr = args.lr
+  config.model_type = args.model_type
+  config.num_features = args.num_features
   kwarg = {
       "share_term": getattr(args, "share_term", False),
       "share_rule": getattr(args, "share_rule", False),
@@ -206,6 +212,24 @@ def main(args, print):
     total_h, total_d, total_c = 0., 0., 0.
     num_sents = 0.
     num_words = 0.
+    # ADDED
+    num_sents_added = 0.
+    topk = 50
+    total_entropy = 0.
+    total_entropy_gt = 0.
+    total_entropy_baseline = 0.
+    total_topk = torch.zeros(topk).cuda()
+    total_topk_gt = torch.zeros(topk).cuda()
+    total_topk_baseline = torch.zeros(topk).cuda()
+    total_diff_kl = 0.
+    total_diff_kl_rev = 0.
+    total_diff_tv = 0.
+    total_diff_log_space = 0.
+    total_diff_kl_baseline = 0.
+    total_diff_kl_rev_baseline = 0.
+    total_diff_tv_baseline = 0.
+    total_diff_log_space_baseline = 0.
+    # ADDED
     all_stats = [[0., 0., 0.]]
     b = 0
     for i in np.random.permutation(len(train_data)):
@@ -221,6 +245,45 @@ def main(args, print):
       """
       lengths = torch.tensor([length] * batch_size, device=sents.device).long() 
       params, kl = model(sents, lengths)
+      # ADDED
+      term_log, rule_probs_log, root_log = params
+      if isinstance(rule_probs_log, tuple):
+          rule_probs_log, rule_probs_gt_log = rule_probs_log
+          params = (term_log, rule_probs_log, root_log)
+      else:
+          rule_probs_gt_log = None
+      rule_probs_log = rule_probs_log.view(-1, model.NT, model.NT_T**2)
+      rule_probs = rule_probs_log.exp()
+      entropy = - (rule_probs_log * rule_probs).sum().item()
+      total_entropy += entropy
+      rule_probs_baseline = rule_probs.new(rule_probs.shape).fill_(1)
+      rule_probs_baseline = rule_probs_baseline / rule_probs_baseline.sum(-1, keepdim=True)
+      rule_probs_baseline_log = rule_probs_baseline.log()
+      entropy_baseline = - (rule_probs_baseline_log * rule_probs_baseline).sum().item()
+      total_entropy_baseline += entropy_baseline
+      rule_probs_topk, _ = torch.topk(rule_probs, topk, -1) # b, NT, topk
+      total_topk += rule_probs_topk.sum(0).sum(0)
+      rule_probs_topk_baseline, _ = torch.topk(rule_probs_baseline, topk, -1) # b, NT, topk
+      total_topk_baseline += rule_probs_topk_baseline.sum(0).sum(0)
+      if rule_probs_gt_log is not None:
+        rule_probs_gt = rule_probs_gt_log.exp()
+        rule_probs_topk_gt, _ = torch.topk(rule_probs_gt, topk, -1) # b, NT, topk
+        total_topk_gt += rule_probs_topk_gt.sum(0).sum(0)
+        entropy = - (rule_probs_gt_log * rule_probs_gt).sum().item()
+        total_entropy_gt += entropy
+        def compute_kl(attn_q, attn_p):
+            """computes KL(q||p)"""
+            return (-attn_q * attn_p.log() + attn_q * attn_q.log()).sum(-1)
+        total_diff_kl += compute_kl(rule_probs, rule_probs_gt).sum().item()
+        total_diff_kl_rev += compute_kl(rule_probs_gt, rule_probs).sum().item()
+        total_diff_tv += torch.abs(rule_probs_gt - rule_probs).sum().item()
+        total_diff_log_space = torch.abs(rule_probs_gt_log - rule_probs_log).sum().item()
+
+        total_diff_kl_baseline += compute_kl(rule_probs_baseline, rule_probs_gt).sum().item()
+        total_diff_kl_rev_baseline += compute_kl(rule_probs_gt, rule_probs_baseline).sum().item()
+        total_diff_tv_baseline += torch.abs(rule_probs_gt - rule_probs_baseline).sum().item()
+        total_diff_log_space_baseline = torch.abs(rule_probs_gt_log - rule_probs_baseline_log).sum().item()
+      # ADDED
       if args.infer_fast: 
         dist = SentCFG(params, lengths=lengths)
         spans = dist.argmax[-1]
@@ -246,6 +309,7 @@ def main(args, print):
       torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)      
       optimizer.step()
       num_sents += batch_size
+      num_sents_added += batch_size
       num_words += batch_size * (length + 1) # we implicitly generate </s> so we explicitly count it
       for bb in range(batch_size):
         span_b = [(a[0], a[1]) for a in argmax_spans[bb] if a[0] != a[1]] #ignore labels
@@ -266,6 +330,57 @@ def main(args, print):
                np.exp(train_nll / num_words), train_kl /num_sents, 
                np.exp((train_nll + train_kl)/num_words), best_val_ppl, best_val_f1, 
                all_f1[0], num_sents / (time.time() - start_time)))
+       # import pdb; pdb.set_trace()
+        d = {'corpus F1': all_f1[0], 'val f1': best_val_f1, 'val ppl': best_val_ppl, 'reconPPL': np.exp(train_nll / num_words), 'kl': train_kl /num_sents, 'ppl bound': np.exp((train_nll + train_kl)/num_words)}
+        d['total_entropy'] = total_entropy/num_sents_added/model.NT
+        print (f'total_entropy = {total_entropy/num_sents_added/model.NT}')
+        if rule_probs_gt_log is not None:
+          print (f'total_entropy_gt = {total_entropy_gt/num_sents_added/model.NT}')
+          d['total_entropy_gt'] = total_entropy_gt/num_sents_added/model.NT
+        print (f'total_entropy_baseline = {total_entropy_baseline/num_sents_added/model.NT}')
+        d['total_entropy_baseline'] = total_entropy_baseline/num_sents_added/model.NT
+        print (f'total_topk = {(total_topk/num_sents_added/model.NT).cpu().tolist()}')
+        d['total_topk'] = (total_topk/num_sents_added/model.NT).cpu().tolist()
+        if rule_probs_gt_log is not None:
+          print (f'total_topk_gt = {(total_topk_gt/num_sents_added/model.NT).cpu().tolist()}')
+          d['total_topk_gt'] = (total_topk_gt/num_sents_added/model.NT).cpu().tolist()
+        print (f'total_topk_baseline = {(total_topk_baseline/num_sents_added/model.NT).cpu().tolist()}')
+        d['total_topk_baseline'] = (total_topk_baseline/num_sents_added/model.NT).cpu().tolist()
+        if rule_probs_gt_log is not None:
+          print (f'total_diff_kl = {total_diff_kl/num_sents_added/model.NT}')
+          d['total_diff_kl'] = total_diff_kl/num_sents_added/model.NT
+          print (f'total_diff_kl_rev = {total_diff_kl_rev/num_sents_added/model.NT}')
+          d['total_diff_kl_rev'] = total_diff_kl_rev/num_sents_added/model.NT
+          print (f'total_diff_tv = {total_diff_tv/num_sents_added/model.NT}')
+          d['total_diff_tv'] = total_diff_tv/num_sents_added/model.NT
+          print (f'total_diff_log_space = {total_diff_log_space/num_sents_added/model.NT}')
+          d['total_diff_log_space'] = total_diff_log_space/num_sents_added/model.NT
+          print (f'total_diff_kl_baseline = {total_diff_kl_baseline/num_sents_added/model.NT}')
+          d['total_diff_kl_baseline'] = total_diff_kl_baseline/num_sents_added/model.NT
+          print (f'total_diff_kl_rev_baseline = {total_diff_kl_rev_baseline/num_sents_added/model.NT}')
+          d['total_diff_kl_rev_baseline'] = total_diff_kl_rev_baseline/num_sents_added/model.NT
+          print (f'total_diff_tv_baseline = {total_diff_tv_baseline/num_sents_added/model.NT}')
+          d['total_diff_tv_baseline'] = total_diff_tv_baseline/num_sents_added/model.NT
+          print (f'total_diff_log_space_baseline = {total_diff_log_space_baseline/num_sents_added/model.NT}')
+          d['total_diff_log_space_baseline'] = total_diff_log_space_baseline/num_sents_added/model.NT
+        wandb.log(d)
+        # ADDED
+        num_sents_added = 0.
+        topk = 50
+        total_entropy = 0.
+        total_entropy_gt = 0.
+        total_entropy_baseline = 0.
+        total_topk = torch.zeros(topk).cuda()
+        total_topk_gt = torch.zeros(topk).cuda()
+        total_topk_baseline = torch.zeros(topk).cuda()
+        total_diff_kl = 0.
+        total_diff_kl_rev = 0.
+        total_diff_tv = 0.
+        total_diff_log_space = 0.
+        total_diff_kl_baseline = 0.
+        total_diff_kl_rev_baseline = 0.
+        total_diff_tv_baseline = 0.
+        total_diff_log_space_baseline = 0.
         # print an example parse
         if not args.infer_fast: 
           tree = get_tree_from_binary_matrix(binary_matrix[0], length)

@@ -1234,7 +1234,10 @@ class CPCFGProj2(torch.nn.Module):
 
             #rule_prob = F.log_softmax(self.rule_mlp(nonterm_emb), -1) # bsz, NT, NT_T**2
             rule_prob = rule_prob.view(b, self.NT, self.NT_T, self.NT_T)
-            return rule_prob
+            with torch.no_grad():
+                rule_prob_gt = torch.matmul(nonterm_emb, bc_emb.transpose(-1, -2)) # bsz, NT, NT_T^2
+                rule_prob_gt = F.log_softmax(rule_prob_gt, -1)
+            return (rule_prob, rule_prob_gt)
 
         roots_ll, terms_ll, rules_ll = roots(), terms(), rules()
         return (terms_ll, rules_ll, roots_ll), kl 
