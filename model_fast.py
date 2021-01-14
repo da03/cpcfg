@@ -498,6 +498,7 @@ def nonnegative_softmax_kernel_feature_creator(
         data: torch.Tensor,
         projection_matrix: torch.Tensor,
         is_query: bool,
+        return_log2: bool=False,
         return_log: bool=False,
         eps: float=0.0001):
     """
@@ -532,8 +533,15 @@ def nonnegative_softmax_kernel_feature_creator(
     diag_data = diag_data / 2.0
     diag_data = diag_data.unsqueeze(-1) # bsz, len, 1
 
+    #if return_log2:
+    #    if is_query:
+    #        # for each query, we can independently scale to avoid overflows
+    #        return data_dash - diag_data - torch.max(data_dash, dim=-1, keepdim=True)[0]) + math.log(eps)
+    #    else:
+    #        # for keys, we need to use the same normalizer to avoid overflows
+    #        return data_dash - diag_data - torch.max(data_dash) + math.log(eps)
     if return_log:
-        return data_dash - diag_data
+        return data_dash - diag_data + math.log(ratio)
 
     # Compute exp(wx - ||x||^2/2)  
     # (Lemma 1, SM(x, y) = E_{w~N(0,I)} exp(wx - ||x||^2/2) exp(wy - ||y||^2/2))
@@ -735,7 +743,10 @@ class CPCFGFixProj(torch.nn.Module):
 
             #rule_prob = F.log_softmax(self.rule_mlp(nonterm_emb), -1) # bsz, NT, NT_T**2
             rule_prob = rule_prob.view(b, self.NT, self.NT_T, self.NT_T)
-            return rule_prob
+            with torch.no_grad():
+                rule_prob_gt = torch.matmul(nonterm_emb, bc_emb.transpose(-1, -2)) # bsz, NT, NT_T^2
+                rule_prob_gt = F.log_softmax(rule_prob_gt, -1)
+            return (rule_prob, rule_prob_gt)
 
         roots_ll, terms_ll, rules_ll = roots(), terms(), rules()
         return (terms_ll, rules_ll, roots_ll), kl 
@@ -898,7 +909,10 @@ class CPCFGProj(torch.nn.Module):
 
             #rule_prob = F.log_softmax(self.rule_mlp(nonterm_emb), -1) # bsz, NT, NT_T**2
             rule_prob = rule_prob.view(b, self.NT, self.NT_T, self.NT_T)
-            return rule_prob
+            with torch.no_grad():
+                rule_prob_gt = torch.matmul(nonterm_emb, bc_emb.transpose(-1, -2)) # bsz, NT, NT_T^2
+                rule_prob_gt = F.log_softmax(rule_prob_gt, -1)
+            return (rule_prob, rule_prob_gt)
 
         roots_ll, terms_ll, rules_ll = roots(), terms(), rules()
         return (terms_ll, rules_ll, roots_ll), kl 
@@ -1222,6 +1236,8 @@ class CPCFGProj2(torch.nn.Module):
             bc_emb = self.rule_mlp.weight.unsqueeze(0) # 1, NT_T^2, H+z
             bc_emb_features = kernel(bc_emb, self.projection_matrix_anti, is_query=False, eps=0.0001, return_log=True) # 1, NT_T^2, r
             #import pdb; pdb.set_trace()
+# bsz, NT, 1, r
+# bsz, 1, NT_T^2, r
 
             rule_prob = (
                      nonterm_emb_features[:,:,None,:] + bc_emb_features[:,None,:,:]
@@ -1236,6 +1252,183 @@ class CPCFGProj2(torch.nn.Module):
             rule_prob = rule_prob.view(b, self.NT, self.NT_T, self.NT_T)
             with torch.no_grad():
                 rule_prob_gt = torch.matmul(nonterm_emb, bc_emb.transpose(-1, -2)) # bsz, NT, NT_T^2
+                rule_prob_gt = F.log_softmax(rule_prob_gt, -1)
+            return (rule_prob, rule_prob_gt)
+
+        roots_ll, terms_ll, rules_ll = roots(), terms(), rules()
+        return (terms_ll, rules_ll, roots_ll), kl 
+
+class CPCFGProjb(torch.nn.Module):
+    def __init__(self, V, NT, T, *args, 
+                 h_dim = 512,
+                 w_dim = 512,
+                 z_dim = 64,
+                 s_dim = 256,
+                 num_features=0, **kwargs): 
+        super(CPCFGProjb, self).__init__()
+        assert z_dim >= 0
+        self.num_features = num_features
+        self.NT_T = NT + T
+        self.NT = NT
+        self.T = T
+        self.z_dim = z_dim
+        self.s_dim = s_dim
+
+        self.share_term = kwargs.get("share_term", False)
+        self.share_rule = kwargs.get("share_rule", False)
+        self.share_root = kwargs.get("share_root", False)
+        self.wo_enc_emb = kwargs.get("wo_enc_emb", False)
+
+        self.term_emb = nn.Parameter(torch.randn(T, s_dim))
+        self.nonterm_emb = nn.Parameter(torch.randn(NT, s_dim))
+        self.root_emb = nn.Parameter(torch.randn(1, s_dim))
+
+        rule_dim = s_dim if self.share_rule else s_dim + z_dim
+        self.rule_mlp = nn.Linear(rule_dim, self.NT_T ** 2)
+        root_dim = s_dim if self.share_root else s_dim + z_dim
+        self.root_mlp = nn.Sequential(nn.Linear(root_dim, s_dim),
+                                      ResLayer(s_dim, s_dim),
+                                      ResLayer(s_dim, s_dim),
+                                      nn.Linear(s_dim, NT))
+
+        projection_matrix = get_2d_array(num_features//2, rule_dim).transpose(0,1)
+        self.projection_matrix_anti = nn.Parameter(torch.cat([projection_matrix, -projection_matrix], -1))
+        #self.projection_matrix_anti.requires_grad = False
+
+
+        if z_dim > 0:
+            i_dim = w_dim
+            self.enc_emb = lambda x: x 
+            if not self.wo_enc_emb:
+                self.enc_emb = nn.Embedding(V, w_dim)
+                self.enc_rnn = nn.LSTM(w_dim, h_dim, 
+                    bidirectional=True, num_layers=1, batch_first=True)
+                i_dim = h_dim * 2
+            self.enc_out = nn.Linear(i_dim, z_dim * 2)
+
+        term_dim = s_dim if self.share_term else s_dim + z_dim
+        self.term_mlp = nn.Sequential(nn.Linear(term_dim, s_dim),
+                                      ResLayer(s_dim, s_dim),
+                                      ResLayer(s_dim, s_dim),
+                                      nn.Linear(s_dim, V))
+        self._initialize()
+
+    def _initialize(self):
+        #import pdb; pdb.set_trace()
+        for n, p in self.named_parameters():
+            print (n)
+            if p.dim() > 1 and ('projection_matrix' not in n):
+                torch.nn.init.xavier_uniform_(p)
+        #import pdb; pdb.set_trace()
+
+    def update_state_dict(self, new_state, strict=True):
+        self.load_state_dict(new_state, strict=strict) 
+
+    def kl(self, mean, lvar):
+        return -0.5 * (lvar - torch.pow(mean, 2) - torch.exp(lvar) + 1)
+
+    def enc(self, x, lengths, max_pooling=True, enforce_sorted=False):
+        x_embbed = self.enc_emb(x)
+        x_packed = pack_padded_sequence(
+            x_embbed, lengths, batch_first=True, enforce_sorted=enforce_sorted
+        )
+        h_packed, _ = self.enc_rnn(x_packed)
+        if max_pooling:
+            padding_value = float("-inf")
+            output, lengths = pad_packed_sequence(
+                h_packed, batch_first=True, padding_value=padding_value
+            )
+            h = output.max(1)[0]
+        else:
+            padding_value = 0
+            output, lengths = pad_packed_sequence(
+                h_packed, batch_first=True, padding_value=padding_value
+            )
+            h = output.sum(1)[0] / lengths.unsqueze(-1)
+        out = self.enc_out(h)
+        mean = out[:, : self.z_dim]
+        lvar = out[:, self.z_dim :]
+        return mean, lvar
+
+    def forward(self, x, lengths, *args, txt=None, txt_lengths=None, use_mean=False, **kwargs):
+        """ x, lengths: word ids; txt, txt_lengths: sub-word ids """
+        b, n = x.shape[:2]
+        batch_size = b 
+        if self.z_dim > 0:
+            max_pooling = kwargs.get("max_pooling", True)
+            enforce_sorted = kwargs.get("enforce_sorted", False)
+            item = (x, lengths, txt, txt_lengths) + args if txt is not None else x
+            mean, lvar = self.enc(
+                item, lengths, max_pooling=max_pooling, enforce_sorted=enforce_sorted
+            )
+            z = mean
+            if not use_mean:
+                z = mean.new(b, mean.size(1)).normal_(0, 1)
+                z = (0.5 * lvar).exp() * z + mean
+            kl = self.kl(mean, lvar).sum(1) 
+        else:
+            z = torch.zeros(b, 1).cuda()
+            kl = None
+        self.z = z
+
+        def roots():
+            root_emb = self.root_emb.expand(b, self.s_dim)
+            if self.z_dim > 0 and not self.share_root:
+                root_emb = torch.cat([root_emb, self.z], -1)
+            root_prob = F.log_softmax(self.root_mlp(root_emb), -1)
+            return root_prob
+        
+        def terms():
+            term_emb = self.term_emb.unsqueeze(0).unsqueeze(1).expand(
+                b, n, self.T, self.s_dim
+            ) 
+            if self.z_dim > 0 and not self.share_term:
+                #z_expand = self.z.unsqueeze(1).unsqueeze(2).expand(
+                #    b, n, self.T, self.z_dim
+                #) # it indeed makes a difference, weird.
+                z_expand = z.unsqueeze(1).expand(b, n, self.z_dim)
+                z_expand = z_expand.unsqueeze(2).expand(b, n, self.T, self.z_dim)
+                term_emb = torch.cat([term_emb, z_expand], -1)
+            term_prob = F.log_softmax(self.term_mlp(term_emb), -1)
+            indices = x.unsqueeze(2).expand(b, n, self.T).unsqueeze(3)
+            term_prob = torch.gather(term_prob, 3, indices).squeeze(3)
+            return term_prob
+
+        def rules():
+            nonterm_emb = self.nonterm_emb.unsqueeze(0).expand(
+                b, self.NT, self.s_dim # bsz, NT, H
+            )
+            if self.z_dim > 0 and not self.share_rule:
+                z_expand = self.z.unsqueeze(1).expand(
+                    b, self.NT, self.z_dim # bsz, NT, z
+                )
+                nonterm_emb = torch.cat([nonterm_emb, z_expand], -1) # bsz, NT, H+z
+
+            #import pdb; pdb.set_trace()
+            #rule_prob_1 = F.log_softmax(self.rule_mlp(nonterm_emb), -1) # bsz, NT, NT_T**2
+            nonterm_emb_features = kernel(nonterm_emb, self.projection_matrix_anti, is_query=True, eps=0.0001, return_log=True) # bsz, NT, r
+            bc_emb = self.rule_mlp.weight.unsqueeze(0) # 1, NT_T^2, H+z
+            bc_emb_bias = self.rule_mlp.bias.view(1, 1, -1) # 1, 1, NT_T^2
+            bc_emb_features = kernel(bc_emb, self.projection_matrix_anti, is_query=False, eps=0.0001, return_log=True) # 1, NT_T^2, r
+            #import pdb; pdb.set_trace()
+# bsz, NT, 1, r
+# bsz, 1, NT_T^2, r
+
+# bsz, NT, NT_T^2
+
+            rule_prob = ((
+                     nonterm_emb_features[:,:,None,:] + bc_emb_features[:,None,:,:]
+                     ).logsumexp(-1) + bc_emb_bias).log_softmax(-1)
+
+            #rule_prob = torch.matmul(nonterm_emb_features, bc_emb_features.transpose(-1, -2)) # bsz, NT, NT_T^2
+            #rule_prob = rule_prob / rule_prob.sum(-1, keepdim=True)
+            #rule_prob = rule_prob.log()
+
+
+            #rule_prob = F.log_softmax(self.rule_mlp(nonterm_emb), -1) # bsz, NT, NT_T**2
+            rule_prob = rule_prob.view(b, self.NT, self.NT_T, self.NT_T)
+            with torch.no_grad():
+                rule_prob_gt = torch.matmul(nonterm_emb, bc_emb.transpose(-1, -2)) + bc_emb_bias # bsz, NT, NT_T^2
                 rule_prob_gt = F.log_softmax(rule_prob_gt, -1)
             return (rule_prob, rule_prob_gt)
 

@@ -19,7 +19,7 @@ from data import Dataset
 from PCFG import PCFG
 from utils import *
 from models import CompPCFG
-from model_fast import CPCFG, CPCFG2, CPCFG3, CPCFGFixProj, CPCFGProj, CPCFGProjDebug, CPCFGProj2
+from model_fast import CPCFG, CPCFG2, CPCFG3, CPCFGFixProj, CPCFGProj, CPCFGProjDebug, CPCFGProj2, CPCFGProjb
 from torch.nn.init import xavier_uniform_
 from torch_struct import SentCFG
 
@@ -126,12 +126,17 @@ def main(args, print):
       model = CPCFGProjDebug
   elif args.model_type == '10th':
       model = CPCFGProj2
+  elif args.model_type == '11th':
+      model = CPCFGProjb
   else:
       raise NameError("Invalid parser type: {}".format(opt.parser_type)) 
+  wandb.run.name = f'{args.model_type}:{args.num_features}:{args.lr}:{args.num_epochs}'
+  wandb.run.save()
   config = wandb.config
   config.lr = args.lr
   config.model_type = args.model_type
   config.num_features = args.num_features
+  config.num_epochs = args.num_epochs
   kwarg = {
       "share_term": getattr(args, "share_term", False),
       "share_rule": getattr(args, "share_rule", False),
@@ -252,38 +257,6 @@ def main(args, print):
           params = (term_log, rule_probs_log, root_log)
       else:
           rule_probs_gt_log = None
-      rule_probs_log = rule_probs_log.view(-1, model.NT, model.NT_T**2)
-      rule_probs = rule_probs_log.exp()
-      entropy = - (rule_probs_log * rule_probs).sum().item()
-      total_entropy += entropy
-      rule_probs_baseline = rule_probs.new(rule_probs.shape).fill_(1)
-      rule_probs_baseline = rule_probs_baseline / rule_probs_baseline.sum(-1, keepdim=True)
-      rule_probs_baseline_log = rule_probs_baseline.log()
-      entropy_baseline = - (rule_probs_baseline_log * rule_probs_baseline).sum().item()
-      total_entropy_baseline += entropy_baseline
-      rule_probs_topk, _ = torch.topk(rule_probs, topk, -1) # b, NT, topk
-      total_topk += rule_probs_topk.sum(0).sum(0)
-      rule_probs_topk_baseline, _ = torch.topk(rule_probs_baseline, topk, -1) # b, NT, topk
-      total_topk_baseline += rule_probs_topk_baseline.sum(0).sum(0)
-      if rule_probs_gt_log is not None:
-        rule_probs_gt = rule_probs_gt_log.exp()
-        rule_probs_topk_gt, _ = torch.topk(rule_probs_gt, topk, -1) # b, NT, topk
-        total_topk_gt += rule_probs_topk_gt.sum(0).sum(0)
-        entropy = - (rule_probs_gt_log * rule_probs_gt).sum().item()
-        total_entropy_gt += entropy
-        def compute_kl(attn_q, attn_p):
-            """computes KL(q||p)"""
-            return (-attn_q * attn_p.log() + attn_q * attn_q.log()).sum(-1)
-        total_diff_kl += compute_kl(rule_probs, rule_probs_gt).sum().item()
-        total_diff_kl_rev += compute_kl(rule_probs_gt, rule_probs).sum().item()
-        total_diff_tv += torch.abs(rule_probs_gt - rule_probs).sum().item()
-        total_diff_log_space = torch.abs(rule_probs_gt_log - rule_probs_log).sum().item()
-
-        total_diff_kl_baseline += compute_kl(rule_probs_baseline, rule_probs_gt).sum().item()
-        total_diff_kl_rev_baseline += compute_kl(rule_probs_gt, rule_probs_baseline).sum().item()
-        total_diff_tv_baseline += torch.abs(rule_probs_gt - rule_probs_baseline).sum().item()
-        total_diff_log_space_baseline = torch.abs(rule_probs_gt_log - rule_probs_baseline_log).sum().item()
-      # ADDED
       if args.infer_fast: 
         dist = SentCFG(params, lengths=lengths)
         spans = dist.argmax[-1]
@@ -304,6 +277,40 @@ def main(args, print):
       kl = torch.zeros_like(nll) if kl is None else kl
       #import pdb; pdb.set_trace()
       (nll + kl + reg).mean().backward()
+      with torch.no_grad():
+        #ADD2
+        rule_probs_log = rule_probs_log.view(-1, model.NT, model.NT_T**2)
+        rule_probs = rule_probs_log.exp()
+        entropy = - (rule_probs_log * rule_probs).sum().item()
+        total_entropy += entropy
+        rule_probs_baseline = rule_probs.new(rule_probs.shape).fill_(1)
+        rule_probs_baseline = rule_probs_baseline / rule_probs_baseline.sum(-1, keepdim=True)
+        rule_probs_baseline_log = rule_probs_baseline.log()
+        entropy_baseline = - (rule_probs_baseline_log * rule_probs_baseline).sum().item()
+        total_entropy_baseline += entropy_baseline
+        rule_probs_topk, _ = torch.topk(rule_probs, topk, -1) # b, NT, topk
+        total_topk += rule_probs_topk.sum(0).sum(0)
+        rule_probs_topk_baseline, _ = torch.topk(rule_probs_baseline, topk, -1) # b, NT, topk
+        total_topk_baseline += rule_probs_topk_baseline.sum(0).sum(0)
+        if rule_probs_gt_log is not None:
+          rule_probs_gt = rule_probs_gt_log.exp()
+          rule_probs_topk_gt, _ = torch.topk(rule_probs_gt, topk, -1) # b, NT, topk
+          total_topk_gt += rule_probs_topk_gt.sum(0).sum(0)
+          entropy = - (rule_probs_gt_log * rule_probs_gt).sum().item()
+          total_entropy_gt += entropy
+          def compute_kl(attn_q, attn_p):
+              """computes KL(q||p)"""
+              return (-attn_q * attn_p.log() + attn_q * attn_q.log()).sum(-1)
+          total_diff_kl += compute_kl(rule_probs, rule_probs_gt).sum().item()
+          total_diff_kl_rev += compute_kl(rule_probs_gt, rule_probs).sum().item()
+          total_diff_tv += torch.abs(rule_probs_gt - rule_probs).sum().item()
+          total_diff_log_space = torch.abs(rule_probs_gt_log - rule_probs_log).sum().item()
+
+          total_diff_kl_baseline += compute_kl(rule_probs_baseline, rule_probs_gt).sum().item()
+          total_diff_kl_rev_baseline += compute_kl(rule_probs_gt, rule_probs_baseline).sum().item()
+          total_diff_tv_baseline += torch.abs(rule_probs_gt - rule_probs_baseline).sum().item()
+          total_diff_log_space_baseline = torch.abs(rule_probs_gt_log - rule_probs_baseline_log).sum().item()
+        # ADDED
       train_nll += nll.sum().item()
       train_kl += kl.sum().item()
       torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)      
@@ -444,6 +451,10 @@ def eval(data, model, print, pcfg):
       """
       lengths = torch.tensor([length] * batch_size, device=sents.device).long() 
       params, kl = model(sents, lengths)
+      term_log, rule_probs_log, root_log = params
+      if isinstance(rule_probs_log, tuple):
+          rule_probs_log, rule_probs_gt_log = rule_probs_log
+          params = (term_log, rule_probs_log, root_log)
       if args.infer_fast: 
         dist = SentCFG(params, lengths=lengths)
         spans = dist.argmax[-1]
@@ -505,6 +516,7 @@ def eval(data, model, print, pcfg):
         (recon_ppl, kl, ppl_elbo, h, d, c))
   print('Corpus F1: %.2f, Sentence F1: %.2f' %
         (corpus_f1*100, sent_f1*100))
+  print (f'==corpus precision: {prec}, corpus recall: {recall}')
   model.train()
   return ppl_elbo, sent_f1*100
 
