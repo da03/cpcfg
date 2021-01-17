@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import sys
 import os
+import math
 import wandb
 wandb.init(project="pcfg")
 
@@ -95,7 +96,8 @@ parser.add_argument('--print_every', type=int, default=1000, help='print stats a
 parser.add_argument('--reg_h_alpha', default=0., type=float, help='entropy of PCFG')
 parser.add_argument('--reg_d_alpha', default=0., type=float, help='prob. dist. of rules of diff. LHS')
 parser.add_argument('--reg_c_alpha', default=0., type=float, help='prob. dist. of rules of the same LHS')
-parser.add_argument('--num_features', default=0., type=int, help='prob. dist. of rules of the same LHS')
+parser.add_argument('--num_features', default=0, type=int, help='prob. dist. of rules of the same LHS')
+parser.add_argument('--accumulate', default=1, type=int, help='prob. dist. of rules of the same LHS')
 
 def main(args, print):
   random.seed(args.seed)
@@ -239,89 +241,99 @@ def main(args, print):
     b = 0
     for i in np.random.permutation(len(train_data)):
       b += 1
-      sents, length, batch_size, _, gold_spans, gold_binary_trees, _ = train_data[i]      
+      #import pdb; pdb.set_trace()
+      sents_full, length, batch_size_full, _, gold_spans_full, gold_binary_trees_full, _ = train_data[i]
+      
       if length > args.max_length or length == 1: #length filter based on curriculum 
         continue
-      sents = sents.cuda()
+
+      batch_size_inner = max(1, batch_size_full // args.accumulate)
+      num_inner_loop = int(math.ceil(batch_size_full / batch_size_inner))
+
       optimizer.zero_grad()
-      """
-      nll, kl, binary_matrix, argmax_spans = model(sents, argmax=True)      
-      (nll+kl).mean().backward()
-      """
-      lengths = torch.tensor([length] * batch_size, device=sents.device).long() 
-      params, kl = model(sents, lengths)
-      # ADDED
-      term_log, rule_probs_log, root_log = params
-      if isinstance(rule_probs_log, tuple):
-          rule_probs_log, rule_probs_gt_log = rule_probs_log
-          params = (term_log, rule_probs_log, root_log)
-      else:
-          rule_probs_gt_log = None
-      if args.infer_fast: 
-        dist = SentCFG(params, lengths=lengths)
-        spans = dist.argmax[-1]
-        argmax_spans, tree = extract_parses(spans, lengths.tolist(), inc=0)
-        nll = -dist.partition
-      else:
-        log_Z = pcfg._inside(*params)
-        nll = -log_Z
-        with torch.no_grad():
-          max_score, binary_matrix, argmax_spans = pcfg._viterbi(*params)
-
-      rule_H, rule_D, rule_C = regularize(params, sents.device, args)
-      reg = (rule_H + rule_D - rule_C).mean()
-      total_h += rule_H.sum().item()
-      total_d += rule_D.sum().item()
-      total_c += rule_C.sum().item()
-
-      kl = torch.zeros_like(nll) if kl is None else kl
-      #import pdb; pdb.set_trace()
-      (nll + kl + reg).mean().backward()
-      with torch.no_grad():
-        #ADD2
-        rule_probs_log = rule_probs_log.view(-1, model.NT, model.NT_T**2)
-        rule_probs = rule_probs_log.exp()
-        entropy = - (rule_probs_log * rule_probs).sum().item()
-        total_entropy += entropy
-        rule_probs_baseline = rule_probs.new(rule_probs.shape).fill_(1)
-        rule_probs_baseline = rule_probs_baseline / rule_probs_baseline.sum(-1, keepdim=True)
-        rule_probs_baseline_log = rule_probs_baseline.log()
-        entropy_baseline = - (rule_probs_baseline_log * rule_probs_baseline).sum().item()
-        total_entropy_baseline += entropy_baseline
-        rule_probs_topk, _ = torch.topk(rule_probs, topk, -1) # b, NT, topk
-        total_topk += rule_probs_topk.sum(0).sum(0)
-        rule_probs_topk_baseline, _ = torch.topk(rule_probs_baseline, topk, -1) # b, NT, topk
-        total_topk_baseline += rule_probs_topk_baseline.sum(0).sum(0)
-        if rule_probs_gt_log is not None:
-          rule_probs_gt = rule_probs_gt_log.exp()
-          rule_probs_topk_gt, _ = torch.topk(rule_probs_gt, topk, -1) # b, NT, topk
-          total_topk_gt += rule_probs_topk_gt.sum(0).sum(0)
-          entropy = - (rule_probs_gt_log * rule_probs_gt).sum().item()
-          total_entropy_gt += entropy
-          def compute_kl(attn_q, attn_p):
-              """computes KL(q||p)"""
-              return (-attn_q * attn_p.log() + attn_q * attn_q.log()).sum(-1)
-          total_diff_kl += compute_kl(rule_probs, rule_probs_gt).sum().item()
-          total_diff_kl_rev += compute_kl(rule_probs_gt, rule_probs).sum().item()
-          total_diff_tv += torch.abs(rule_probs_gt - rule_probs).sum().item()
-          total_diff_log_space = torch.abs(rule_probs_gt_log - rule_probs_log).sum().item()
-
-          total_diff_kl_baseline += compute_kl(rule_probs_baseline, rule_probs_gt).sum().item()
-          total_diff_kl_rev_baseline += compute_kl(rule_probs_gt, rule_probs_baseline).sum().item()
-          total_diff_tv_baseline += torch.abs(rule_probs_gt - rule_probs_baseline).sum().item()
-          total_diff_log_space_baseline = torch.abs(rule_probs_gt_log - rule_probs_baseline_log).sum().item()
+      for inner_loop in range(num_inner_loop):
+        start = inner_loop * batch_size_inner
+        end = min(batch_size_full, (inner_loop + 1) * batch_size_inner)
+        sents = sents_full[start:end]
+        batch_size = sents.size(0)
+        gold_spans = gold_spans_full[start:end]
+        gold_binary_trees = gold_binary_trees_full[start:end]
+        sents = sents.cuda()
+        lengths = torch.tensor([length] * batch_size, device=sents.device).long() 
+        params, kl = model(sents, lengths)
         # ADDED
-      train_nll += nll.sum().item()
-      train_kl += kl.sum().item()
+        term_log, rule_probs_log, root_log = params
+        if isinstance(rule_probs_log, tuple):
+            rule_probs_log, rule_probs_gt_log = rule_probs_log
+            params = (term_log, rule_probs_log, root_log)
+        else:
+            rule_probs_gt_log = None
+        if args.infer_fast: 
+          dist = SentCFG(params, lengths=lengths)
+          spans = dist.argmax[-1]
+          argmax_spans, tree = extract_parses(spans, lengths.tolist(), inc=0)
+          nll = -dist.partition
+        else:
+          assert False
+          log_Z = pcfg._inside(*params)
+          nll = -log_Z
+          with torch.no_grad():
+            max_score, binary_matrix, argmax_spans = pcfg._viterbi(*params)
+
+        rule_H, rule_D, rule_C = regularize(params, sents.device, args)
+        reg = (rule_H + rule_D - rule_C).mean()
+        total_h += rule_H.sum().item()
+        total_d += rule_D.sum().item()
+        total_c += rule_C.sum().item()
+
+        kl = torch.zeros_like(nll) if kl is None else kl
+        #import pdb; pdb.set_trace()
+        ((nll + kl + reg).sum()/batch_size_full).backward()
+        with torch.no_grad():
+          #ADD2
+          rule_probs_log = rule_probs_log.view(-1, model.NT, model.NT_T**2)
+          rule_probs = rule_probs_log.exp()
+          entropy = - (rule_probs_log * rule_probs).sum().item()
+          total_entropy += entropy
+          rule_probs_baseline = rule_probs.new(rule_probs.shape).fill_(1)
+          rule_probs_baseline = rule_probs_baseline / rule_probs_baseline.sum(-1, keepdim=True)
+          rule_probs_baseline_log = rule_probs_baseline.log()
+          entropy_baseline = - (rule_probs_baseline_log * rule_probs_baseline).sum().item()
+          total_entropy_baseline += entropy_baseline
+          rule_probs_topk, _ = torch.topk(rule_probs, topk, -1) # b, NT, topk
+          total_topk += rule_probs_topk.sum(0).sum(0)
+          rule_probs_topk_baseline, _ = torch.topk(rule_probs_baseline, topk, -1) # b, NT, topk
+          total_topk_baseline += rule_probs_topk_baseline.sum(0).sum(0)
+          if rule_probs_gt_log is not None:
+            rule_probs_gt = rule_probs_gt_log.exp()
+            rule_probs_topk_gt, _ = torch.topk(rule_probs_gt, topk, -1) # b, NT, topk
+            total_topk_gt += rule_probs_topk_gt.sum(0).sum(0)
+            entropy = - (rule_probs_gt_log * rule_probs_gt).sum().item()
+            total_entropy_gt += entropy
+            def compute_kl(attn_q, attn_p):
+                """computes KL(q||p)"""
+                return (-attn_q * attn_p.log() + attn_q * attn_q.log()).sum(-1)
+            total_diff_kl += compute_kl(rule_probs, rule_probs_gt).sum().item()
+            total_diff_kl_rev += compute_kl(rule_probs_gt, rule_probs).sum().item()
+            total_diff_tv += torch.abs(rule_probs_gt - rule_probs).sum().item()
+            total_diff_log_space = torch.abs(rule_probs_gt_log - rule_probs_log).sum().item()
+
+            total_diff_kl_baseline += compute_kl(rule_probs_baseline, rule_probs_gt).sum().item()
+            total_diff_kl_rev_baseline += compute_kl(rule_probs_gt, rule_probs_baseline).sum().item()
+            total_diff_tv_baseline += torch.abs(rule_probs_gt - rule_probs_baseline).sum().item()
+            total_diff_log_space_baseline = torch.abs(rule_probs_gt_log - rule_probs_baseline_log).sum().item()
+          # ADDED
+        train_nll += nll.sum().item()
+        train_kl += kl.sum().item()
+        num_sents += batch_size
+        num_sents_added += batch_size
+        num_words += batch_size * (length + 1) # we implicitly generate </s> so we explicitly count it
+        for bb in range(batch_size):
+          span_b = [(a[0], a[1]) for a in argmax_spans[bb] if a[0] != a[1]] #ignore labels
+          span_b_set = set(span_b[:-1])
+          update_stats(span_b_set, [set(gold_spans[bb][:-1])], all_stats)
       torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)      
       optimizer.step()
-      num_sents += batch_size
-      num_sents_added += batch_size
-      num_words += batch_size * (length + 1) # we implicitly generate </s> so we explicitly count it
-      for bb in range(batch_size):
-        span_b = [(a[0], a[1]) for a in argmax_spans[bb] if a[0] != a[1]] #ignore labels
-        span_b_set = set(span_b[:-1])
-        update_stats(span_b_set, [set(gold_spans[bb][:-1])], all_stats)
       if b % args.print_every == 0:
         all_f1 = get_f1(all_stats)
         param_norm = sum([p.norm()**2 for p in model.parameters()]).item()**0.5
@@ -401,6 +413,7 @@ def main(args, print):
     args.max_length = min(args.final_max_length, args.max_length + args.len_incr)
     print('--------------------------------')
     print('Checking validation perf...')    
+    #import pdb; pdb.set_trace()
     val_ppl, val_f1 = eval(val_data, model, print, pcfg)
     print('--------------------------------')
 
@@ -439,66 +452,78 @@ def eval(data, model, print, pcfg):
   sent_f1 = [] 
   with torch.no_grad():
     for i in range(len(data)):
-      sents, length, batch_size, _, gold_spans, gold_binary_trees, other_data = data[i] 
+      sents_full, length, batch_size_full, _, gold_spans_full, gold_binary_trees_full, _ = data[i]
       if length == 1:
         continue
-      sents = sents.cuda()
-      # note that for unsuperised parsing, we should do model(sents, argmax=True, use_mean = True)
-      # but we don't for eval since we want a valid upper bound on PPL for early stopping
-      # see eval.py for proper MAP inference
-      """
-      nll, kl, binary_matrix, argmax_spans = model(sents, argmax=True)
-      """
-      lengths = torch.tensor([length] * batch_size, device=sents.device).long() 
-      params, kl = model(sents, lengths)
-      term_log, rule_probs_log, root_log = params
-      if isinstance(rule_probs_log, tuple):
-          rule_probs_log, rule_probs_gt_log = rule_probs_log
-          params = (term_log, rule_probs_log, root_log)
-      if args.infer_fast: 
-        dist = SentCFG(params, lengths=lengths)
-        spans = dist.argmax[-1]
-        argmax_spans, tree = extract_parses(spans, lengths.tolist(), inc=0)
-        nll = -dist.partition
-      else:
-        log_Z = pcfg._inside(*params)
-        nll = -log_Z
-        with torch.no_grad():
-          max_score, binary_matrix, argmax_spans = pcfg._viterbi(*params)
+      if length > 50:
+        continue
+      #print (length)
+      #print ('b') 
+      #print (batch_size_full)
+      batch_size_inner = max(1, batch_size_full // args.accumulate)
+      num_inner_loop = int(math.ceil(batch_size_full / batch_size_inner))
 
-      kl = torch.zeros_like(nll) if kl is None else kl
-      total_nll += nll.sum().item()
-      total_kl  += kl.sum().item()
+      for inner_loop in range(num_inner_loop):
+        start = inner_loop * batch_size_inner
+        end = min(batch_size_full, (inner_loop + 1) * batch_size_inner)
+        sents = sents_full[start:end]
+        batch_size = sents.size(0)
+        gold_spans = gold_spans_full[start:end]
+        gold_binary_trees = gold_binary_trees_full[start:end]
+        sents = sents.cuda()
+        # note that for unsuperised parsing, we should do model(sents, argmax=True, use_mean = True)
+        # but we don't for eval since we want a valid upper bound on PPL for early stopping
+        # see eval.py for proper MAP inference
+        lengths = torch.tensor([length] * batch_size, device=sents.device).long() 
+        params, kl = model(sents, lengths)
+        term_log, rule_probs_log, root_log = params
+        if isinstance(rule_probs_log, tuple):
+            rule_probs_log, rule_probs_gt_log = rule_probs_log
+            params = (term_log, rule_probs_log, root_log)
+        if args.infer_fast: 
+          dist = SentCFG(params, lengths=lengths)
+          spans = dist.argmax[-1]
+          argmax_spans, tree = extract_parses(spans, lengths.tolist(), inc=0)
+          nll = -dist.partition
+        else:
+          log_Z = pcfg._inside(*params)
+          nll = -log_Z
+          with torch.no_grad():
+            max_score, binary_matrix, argmax_spans = pcfg._viterbi(*params)
 
-      rule_H, rule_D, rule_C = regularize(params, sents.device, args)
-      total_h += rule_H.sum().item()
-      total_d += rule_D.sum().item()
-      total_c += rule_C.sum().item()
+        kl = torch.zeros_like(nll) if kl is None else kl
+        total_nll += nll.sum().item()
+        total_kl  += kl.sum().item()
 
-      num_sents += batch_size
-      num_words += batch_size*(length +1) # we implicitly generate </s> so we explicitly count it
-      for b in range(batch_size):
-        span_b = [(a[0], a[1]) for a in argmax_spans[b] if a[0] != a[1]] #ignore labels
-        span_b_set = set(span_b[:-1])        
-        gold_b_set = set(gold_spans[b][:-1])
-        tp, fp, fn = get_stats(span_b_set, gold_b_set) 
-        corpus_f1[0] += tp
-        corpus_f1[1] += fp
-        corpus_f1[2] += fn
-        # sent-level F1 is based on L83-89 from https://github.com/yikangshen/PRPN/test_phrase_grammar.py
+        rule_H, rule_D, rule_C = regularize(params, sents.device, args)
+        total_h += rule_H.sum().item()
+        total_d += rule_D.sum().item()
+        total_c += rule_C.sum().item()
 
-        model_out = span_b_set
-        std_out = gold_b_set
-        overlap = model_out.intersection(std_out)
-        prec = float(len(overlap)) / (len(model_out) + 1e-8)
-        reca = float(len(overlap)) / (len(std_out) + 1e-8)
-        if len(std_out) == 0:
-          reca = 1. 
-          if len(model_out) == 0:
-            prec = 1.
-        f1 = 2 * prec * reca / (prec + reca + 1e-8)
-        sent_f1.append(f1)
-      #break
+        num_sents += batch_size
+        num_words += batch_size*(length +1) # we implicitly generate </s> so we explicitly count it
+        for b in range(batch_size):
+          span_b = [(a[0], a[1]) for a in argmax_spans[b] if a[0] != a[1]] #ignore labels
+          span_b_set = set(span_b[:-1])        
+          gold_b_set = set(gold_spans[b][:-1])
+          tp, fp, fn = get_stats(span_b_set, gold_b_set) 
+          corpus_f1[0] += tp
+          corpus_f1[1] += fp
+          corpus_f1[2] += fn
+          # sent-level F1 is based on L83-89 from https://github.com/yikangshen/PRPN/test_phrase_grammar.py
+
+          model_out = span_b_set
+          std_out = gold_b_set
+          overlap = model_out.intersection(std_out)
+          prec = float(len(overlap)) / (len(model_out) + 1e-8)
+          reca = float(len(overlap)) / (len(std_out) + 1e-8)
+          if len(std_out) == 0:
+            reca = 1. 
+            if len(model_out) == 0:
+              prec = 1.
+          f1 = 2 * prec * reca / (prec + reca + 1e-8)
+          sent_f1.append(f1)
+        #break
   tp, fp, fn = corpus_f1  
   prec = tp / (tp + fp)
   recall = tp / (tp + fn)
